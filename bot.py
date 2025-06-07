@@ -11,6 +11,7 @@ from telegram.ext import (
     ConversationHandler
 )
 from dotenv import load_dotenv
+from database import Database
 
 load_dotenv()
 
@@ -22,15 +23,15 @@ DISPATCHER_IDS = [int(x) for x in os.getenv('DISPATCHER_IDS').split(',')]
 # Состояния
 ADDRESS, CONTACTS, TIME = range(3)
 
-# Хранилище заказов в памяти (для простоты)
-orders = {}
-order_counter = 1
-
-# Включим логирование
+# Инициализация логгера
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", 
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# Инициализация базы данных
+db = Database()
 
 # Клавиатуры
 def main_keyboard():
@@ -53,7 +54,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def create_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.callback_query.from_user.id
     if user_id not in DISPATCHER_IDS:
-        await update.callback_query.answer("Только для диспетчеров!")
+        await update.callback_query.answer("Только для диспетчеров!", show_alert=True)
         return ConversationHandler.END
         
     await update.callback_query.message.reply_text("📍 Введите адрес:")
@@ -70,66 +71,61 @@ async def get_contacts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return TIME
 
 async def get_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global order_counter
-    
     address = context.user_data['address']
     contacts = context.user_data['contacts']
     time = update.message.text
     
-    # Сохраняем заказ
-    orders[order_counter] = {
-        'address': address,
-        'contacts': contacts,
-        'time': time,
-        'status': 'open',
-        'worker': None
-    }
+    # Сохраняем заказ в базу данных
+    order_id = await db.add_order(address, contacts, time)
     
     # Отправляем в группу
     await context.bot.send_message(
         chat_id=GROUP_ID,
-        text=f"🚨 НОВЫЙ ЗАКАЗ #{order_counter}\n\n"
+        text=f"🚨 НОВЫЙ ЗАКАЗ #{order_id}\n\n"
              f"📍 Адрес: {address}\n"
              f"📞 Телефон: {contacts}\n"
              f"⏰ Время: {time}",
-        reply_markup=accept_keyboard(order_counter)
+        reply_markup=accept_keyboard(order_id)
     )
     
-    await update.message.reply_text(f"✅ Заказ #{order_counter} создан!")
-    order_counter += 1
+    await update.message.reply_text(f"✅ Заказ #{order_id} создан!")
     return ConversationHandler.END
 
 async def accept_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     order_id = int(query.data.split('_')[1])
+    worker_id = query.from_user.id
+    worker_name = query.from_user.full_name
     
-    if orders[order_id]['status'] != 'open':
-        await query.answer("Заказ уже принят!")
-        return
-        
-    # Обновляем статус
-    orders[order_id]['status'] = 'accepted'
-    orders[order_id]['worker'] = query.from_user.full_name
+    # Обновляем заказ в базе данных
+    await db.assign_order(order_id, worker_id, worker_name)
     
     # Обновляем сообщение
     await query.edit_message_text(
         text=f"{query.message.text}\n\n"
-             f"✅ Принял: {query.from_user.full_name}",
+             f"✅ Принял: {worker_name}",
         reply_markup=None
     )
     
     await query.answer(f"Вы приняли заказ #{order_id}!")
 
+async def init_db():
+    await db.connect()
+
 def main():
+    # Инициализация приложения
     app = Application.builder().token(BOT_TOKEN).build()
+    
+    # Инициализация БД
+    app.run_polling(init_db(), close_loop=False)
     
     # Обработчики
     conv_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(create_order, pattern="create_order")],
         states={
-            ADDRESS: [MessageHandler(filters.TEXT, get_address)],
-            CONTACTS: [MessageHandler(filters.TEXT, get_contacts)],
-            TIME: [MessageHandler(filters.TEXT, get_time)]
+            ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_address)],
+            CONTACTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_contacts)],
+            TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_time)]
         },
         fallbacks=[]
     )
